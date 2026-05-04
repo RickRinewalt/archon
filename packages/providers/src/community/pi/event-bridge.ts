@@ -92,7 +92,8 @@ export function serializeToolResult(result: unknown): string {
   if (typeof result === 'string') return result;
   try {
     return JSON.stringify(result);
-  } catch {
+  } catch (err) {
+    getLog().warn({ err }, 'pi.event-bridge.tool_result_serialize_failed');
     return String(result);
   }
 }
@@ -146,17 +147,30 @@ export function buildResultChunk(messages: readonly unknown[]): MessageChunk {
     tokens,
     ...(tokens.cost !== undefined ? { cost: tokens.cost } : {}),
     ...(last.stopReason ? { stopReason: last.stopReason } : {}),
-    ...(isError ? { isError: true, errorSubtype: last.stopReason } : {}),
+    ...(isError
+      ? {
+          isError: true,
+          errorSubtype: last.stopReason,
+          // Surfacing errorMessage in errors[] is what makes the executor's
+          // transient-error classifier (which pattern-matches on the thrown
+          // message) able to retry Pi-side 429/overload failures.
+          ...(last.errorMessage ? { errors: [last.errorMessage] } : {}),
+        }
+      : {}),
   };
   return chunk;
 }
 
 /**
  * Attempt to parse a Pi assistant transcript as the structured-output JSON
- * requested via `outputFormat`. Handles two common model failure modes:
+ * requested via `outputFormat`. Handles three common model failure modes:
  *  - trailing/leading whitespace (always stripped)
  *  - markdown code fences (```json ... ``` or bare ``` ... ```) that models
  *    emit despite the "no code fences" instruction in the prompt
+ *  - prose preamble followed by a single trailing JSON object — pattern
+ *    observed on Minimax M2.7 ("Now I have all the inputs. Let me evaluate
+ *    the three gates: ... {...}"). Reasoning models tend to "think out loud"
+ *    before emitting structured output despite explicit JSON-only prompts.
  *
  * Returns the parsed value on success, `undefined` on any failure. Callers
  * treat `undefined` as "structured output unavailable" and degrade via the
@@ -171,11 +185,30 @@ export function tryParseStructuredOutput(text: string): unknown {
     .replace(/^```(?:json)?\s*\n?/i, '')
     .replace(/\n?\s*```\s*$/, '')
     .trim();
+
+  // Tier 1: clean parse — fast path for fully compliant outputs.
   try {
     return JSON.parse(cleaned);
   } catch {
-    return undefined;
+    // fall through
   }
+
+  // Tier 2: scan forward to the FIRST `{` and parse from there. Recovers the
+  // preamble-then-JSON pattern reasoning models emit. A backward scan from
+  // the last `{` was considered but rejected: it silently returns the wrong
+  // object when the prose contains a brace-bearing example after the real
+  // payload (e.g. `{"actual":1}\nFor example: {"x":2}` would yield `{x:2}`),
+  // breaking the conservative-failure contract callers rely on.
+  const firstBrace = cleaned.indexOf('{');
+  if (firstBrace > 0) {
+    try {
+      return JSON.parse(cleaned.slice(firstBrace));
+    } catch {
+      // fall through
+    }
+  }
+
+  return undefined;
 }
 
 /**
@@ -247,17 +280,6 @@ export function mapPiEvent(event: AgentSessionEvent): MessageChunk[] {
 }
 
 /**
- * Bridge a Pi `AgentSession` into Archon's `AsyncGenerator<MessageChunk>` contract.
- *
- * Behavior:
- *  - subscribe before calling prompt, unsubscribe in finally
- *  - yield mapped events in order
- *  - complete on successful `session.prompt()` resolution
- *  - throw on `session.prompt()` rejection or listener-raised errors
- *  - forward `abortSignal` to `session.abort()` fire-and-forget
- *  - always `dispose()` the session to avoid listener accumulation
- */
-/**
  * Internal queue payload for `bridgeSession`. Exported at module scope
  * (not inside the generator) so unit tests can exercise each variant
  * independently without reaching into the generator's closure.
@@ -272,6 +294,17 @@ export interface BridgeNotifier {
   setEmitter(fn: ((chunk: MessageChunk) => void) | undefined): void;
 }
 
+/**
+ * Bridge a Pi `AgentSession` into Archon's `AsyncGenerator<MessageChunk>` contract.
+ *
+ * Behavior:
+ *  - subscribe before calling prompt, unsubscribe in finally
+ *  - yield mapped events in order
+ *  - complete on successful `session.prompt()` resolution
+ *  - throw on `session.prompt()` rejection or listener-raised errors
+ *  - forward `abortSignal` to `session.abort()` fire-and-forget
+ *  - always `dispose()` the session to avoid listener accumulation
+ */
 export async function* bridgeSession(
   session: AgentSession,
   prompt: string,
@@ -379,9 +412,19 @@ export async function* bridgeSession(
       // debug so SDK regressions surface without polluting normal output.
       getLog().debug({ err }, 'pi.event-bridge.dispose_failed');
     }
-    // Ensure the prompt promise settles so callers see no dangling work.
-    await promptPromise.catch(() => {
-      /* errors already surfaced through the queue */
+    // Don't await promptPromise. The queue is closed above (line 392), and the
+    // .then() handlers attached at construction (line 344) only push to that
+    // queue — closed pushes are no-ops. There's nothing the caller is waiting
+    // for; whether prompt() resolves in 1ms or never, no observable behavior
+    // changes. Awaiting it is what caused #1561: Pi's session.prompt() can
+    // hang indefinitely after dispose(), keeping generator.return() suspended,
+    // draining Bun's event loop, and exiting with code 0 mid-workflow.
+    //
+    // Attach .catch() defensively so a stray async rejection (the .then()
+    // handlers should preclude this, but belt-and-suspenders) doesn't bubble
+    // up as an unhandled-rejection process exit.
+    promptPromise.catch((err: unknown) => {
+      getLog().debug({ err }, 'pi.event-bridge.prompt_rejected_after_close');
     });
   }
 }

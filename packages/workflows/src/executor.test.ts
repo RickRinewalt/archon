@@ -75,6 +75,7 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     updateWorkflowRun: mock(async () => {}),
     failWorkflowRun: mock(async () => {}),
     getWorkflowRun: mock(async () => ({ ...makeRun(), status: 'completed' as const })),
+    getWorkflowRunStatus: mock(async () => 'completed' as const),
     createWorkflowEvent: mock(async () => {}),
     findResumableRun: mock(async () => null),
     getCompletedDagNodeOutputs: mock(async () => new Map()),
@@ -298,6 +299,43 @@ describe('executeWorkflow', () => {
       expect(sentMessage).toContain('--branch');
     });
 
+    it('skips path-lock check when mutates_checkout is false', async () => {
+      const getActiveSpy = mock(async () =>
+        makeRun({ id: 'other-run', status: 'running' as const })
+      );
+      const store = makeStore({ getActiveWorkflowRunByPath: getActiveSpy });
+      const deps = makeDeps(store);
+      const result = await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ mutates_checkout: false }),
+        'test message',
+        'db-conv-1'
+      );
+      // Guard skipped: spy never called, run succeeds
+      expect(getActiveSpy).not.toHaveBeenCalled();
+      expect(result.workflowRunId).toBe('run-123');
+    });
+
+    it('still enforces path lock when mutates_checkout is true', async () => {
+      const otherRun = makeRun({ id: 'other-run-456', status: 'running' as const });
+      const store = makeStore({ getActiveWorkflowRunByPath: mock(async () => otherRun) });
+      const deps = makeDeps(store);
+      const result = await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ mutates_checkout: true }),
+        'test message',
+        'db-conv-1'
+      );
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('already active');
+    });
+
     it('still returns failure when guard self-cancel update throws (best-effort)', async () => {
       const selfRun = makeRun({ id: 'self-run', status: 'pending' });
       const otherRun = makeRun({ id: 'other-run', status: 'running' });
@@ -431,10 +469,11 @@ describe('executeWorkflow', () => {
       expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
     });
 
-    it('infers claude provider when workflow sets a claude model alias', async () => {
+    it('passes workflow.model through unchanged when workflow.provider is unset', async () => {
       const store = makeStore();
       const deps = makeDeps(store);
-      // config.assistant defaults to 'claude', model 'sonnet' is a claude alias
+      // Provider falls back to config.assistant ('claude'); model is forwarded
+      // verbatim. The SDK is the source of truth for what model strings work.
       await executeWorkflow(
         deps,
         makePlatform(),
@@ -447,7 +486,26 @@ describe('executeWorkflow', () => {
       expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
     });
 
-    it('throws when model is incompatible with explicit provider', async () => {
+    it('passes provider+model through to the SDK without re-routing on model name', async () => {
+      // Provider is explicit; the model string is forwarded verbatim to
+      // whichever SDK the resolved provider names. A workflow that sets
+      // provider:codex with a Claude-looking model gets the request handed
+      // to the codex SDK as-is — the SDK decides whether to accept it.
+      const store = makeStore();
+      const deps = makeDeps(store);
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ provider: 'codex', model: 'sonnet' }),
+        'test message',
+        'db-conv-1'
+      );
+      expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
+    });
+
+    it('throws when workflow.provider is not a registered provider', async () => {
       const store = makeStore();
       const deps = makeDeps(store);
       await expect(
@@ -456,11 +514,11 @@ describe('executeWorkflow', () => {
           makePlatform(),
           'conv-1',
           '/tmp',
-          makeWorkflow({ provider: 'codex', model: 'sonnet' }),
+          makeWorkflow({ provider: 'claud', model: 'sonnet' }),
           'test message',
           'db-conv-1'
         )
-      ).rejects.toThrow('not compatible');
+      ).rejects.toThrow(/unknown provider 'claud'/);
     });
   });
 
@@ -893,5 +951,55 @@ describe('executeWorkflow', () => {
       expect(msg).toContain('running 1m');
       expect(msg).toContain('Wait for it to finish');
     });
+  });
+});
+
+describe('finally backstop', () => {
+  it('calls failWorkflowRun when run is still running at finally', async () => {
+    const failSpy = mock(async () => {});
+    const store = makeStore({
+      getWorkflowRunStatus: mock(async () => 'running' as const),
+      failWorkflowRun: failSpy,
+    });
+    const deps = makeDeps(store);
+
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(),
+      'test',
+      'db-conv-1'
+    );
+
+    const call = (failSpy.mock.calls as unknown[][]).find(
+      c => typeof c[1] === 'string' && (c[1] as string).includes('exited without finalizing')
+    );
+    expect(call).toBeDefined();
+  });
+
+  it('does not call failWorkflowRun when run already completed', async () => {
+    const failSpy = mock(async () => {});
+    const store = makeStore({
+      getWorkflowRunStatus: mock(async () => 'completed' as const),
+      failWorkflowRun: failSpy,
+    });
+    const deps = makeDeps(store);
+
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(),
+      'test',
+      'db-conv-1'
+    );
+
+    const backstopCall = (failSpy.mock.calls as unknown[][]).find(
+      c => typeof c[1] === 'string' && (c[1] as string).includes('exited without finalizing')
+    );
+    expect(backstopCall).toBeUndefined();
   });
 });
